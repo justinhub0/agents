@@ -1,0 +1,382 @@
+'use strict';
+
+var messages = require('@langchain/core/messages');
+var langgraph = require('@langchain/langgraph');
+var _enum = require('../common/enum.cjs');
+require('nanoid');
+require('../messages/core.cjs');
+var run = require('../utils/run.cjs');
+require('js-tiktoken/lite');
+
+/**
+ * Helper to check if a value is a Send object
+ */
+function isSend(value) {
+    return value instanceof langgraph.Send;
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+class ToolNode extends run.RunnableCallable {
+    toolMap;
+    loadRuntimeTools;
+    handleToolErrors = true;
+    trace = false;
+    toolCallStepIds;
+    errorHandler;
+    toolUsageCount;
+    /** Tool registry for filtering (lazy computation of programmatic maps) */
+    toolRegistry;
+    /** Cached programmatic tools (computed once on first PTC call) */
+    programmaticCache;
+    /** Reference to Graph's sessions map for automatic session injection */
+    sessions;
+    constructor({ tools, toolMap, name, tags, errorHandler, toolCallStepIds, handleToolErrors, loadRuntimeTools, toolRegistry, sessions, }) {
+        super({ name, tags, func: (input, config) => this.run(input, config) });
+        this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+        this.toolCallStepIds = toolCallStepIds;
+        this.handleToolErrors = handleToolErrors ?? this.handleToolErrors;
+        this.loadRuntimeTools = loadRuntimeTools;
+        this.errorHandler = errorHandler;
+        this.toolUsageCount = new Map();
+        this.toolRegistry = toolRegistry;
+        this.sessions = sessions;
+    }
+    /**
+     * Returns cached programmatic tools, computing once on first access.
+     * Single iteration builds both toolMap and toolDefs simultaneously.
+     */
+    getProgrammaticTools() {
+        if (this.programmaticCache)
+            return this.programmaticCache;
+        const toolMap = new Map();
+        const toolDefs = [];
+        if (this.toolRegistry) {
+            for (const [name, toolDef] of this.toolRegistry) {
+                if ((toolDef.allowed_callers ?? ['direct']).includes('code_execution')) {
+                    toolDefs.push(toolDef);
+                    const tool = this.toolMap.get(name);
+                    if (tool)
+                        toolMap.set(name, tool);
+                }
+            }
+        }
+        this.programmaticCache = { toolMap, toolDefs };
+        return this.programmaticCache;
+    }
+    /**
+     * Returns a snapshot of the current tool usage counts.
+     * @returns A ReadonlyMap where keys are tool names and values are their usage counts.
+     */
+    getToolUsageCounts() {
+        return new Map(this.toolUsageCount); // Return a copy
+    }
+    /**
+     * Runs a single tool call with error handling
+     */
+    async runTool(call, config) {
+        const tool = this.toolMap.get(call.name);
+        try {
+            if (tool === undefined) {
+                throw new Error(`Tool "${call.name}" not found.`);
+            }
+            const turn = this.toolUsageCount.get(call.name) ?? 0;
+            this.toolUsageCount.set(call.name, turn + 1);
+            const args = call.args;
+            const stepId = this.toolCallStepIds?.get(call.id);
+            // Build invoke params - LangChain extracts non-schema fields to config.toolCall
+            let invokeParams = {
+                ...call,
+                args,
+                type: 'tool_call',
+                stepId,
+                turn,
+            };
+            // Inject runtime data for special tools (becomes available at config.toolCall)
+            if (call.name === _enum.Constants.PROGRAMMATIC_TOOL_CALLING) {
+                const { toolMap, toolDefs } = this.getProgrammaticTools();
+                invokeParams = {
+                    ...invokeParams,
+                    toolMap,
+                    toolDefs,
+                };
+            }
+            else if (call.name === _enum.Constants.TOOL_SEARCH) {
+                invokeParams = {
+                    ...invokeParams,
+                    toolRegistry: this.toolRegistry,
+                };
+            }
+            /**
+             * Inject session context for code execution tools when available.
+             * Each file uses its own session_id (supporting multi-session file tracking).
+             * Both session_id and _injected_files are injected directly to invokeParams
+             * (not inside args) so they bypass Zod schema validation and reach config.toolCall.
+             */
+            if (call.name === _enum.Constants.EXECUTE_CODE ||
+                call.name === _enum.Constants.PROGRAMMATIC_TOOL_CALLING) {
+                const codeSession = this.sessions?.get(_enum.Constants.EXECUTE_CODE);
+                if (codeSession?.files != null && codeSession.files.length > 0) {
+                    /**
+                     * Convert tracked files to CodeEnvFile format for the API.
+                     * Each file uses its own session_id (set when file was created).
+                     * This supports files from multiple parallel/sequential executions.
+                     */
+                    const fileRefs = codeSession.files.map((file) => ({
+                        session_id: file.session_id ?? codeSession.session_id,
+                        id: file.id,
+                        name: file.name,
+                    }));
+                    /** Inject latest session_id and files - bypasses Zod, reaches config.toolCall */
+                    invokeParams = {
+                        ...invokeParams,
+                        session_id: codeSession.session_id,
+                        _injected_files: fileRefs,
+                    };
+                }
+            }
+            const output = await tool.invoke(invokeParams, config);
+            if ((messages.isBaseMessage(output) && output._getType() === 'tool') ||
+                langgraph.isCommand(output)) {
+                return output;
+            }
+            else {
+                return new messages.ToolMessage({
+                    status: 'success',
+                    name: tool.name,
+                    content: typeof output === 'string' ? output : JSON.stringify(output),
+                    tool_call_id: call.id,
+                });
+            }
+        }
+        catch (_e) {
+            const e = _e;
+            if (!this.handleToolErrors) {
+                throw e;
+            }
+            if (langgraph.isGraphInterrupt(e)) {
+                throw e;
+            }
+            if (this.errorHandler) {
+                try {
+                    await this.errorHandler({
+                        error: e,
+                        id: call.id,
+                        name: call.name,
+                        input: call.args,
+                    }, config.metadata);
+                }
+                catch (handlerError) {
+                    // eslint-disable-next-line no-console
+                    console.error('Error in errorHandler:', {
+                        toolName: call.name,
+                        toolCallId: call.id,
+                        toolArgs: call.args,
+                        stepId: this.toolCallStepIds?.get(call.id),
+                        turn: this.toolUsageCount.get(call.name),
+                        originalError: {
+                            message: e.message,
+                            stack: e.stack ?? undefined,
+                        },
+                        handlerError: handlerError instanceof Error
+                            ? {
+                                message: handlerError.message,
+                                stack: handlerError.stack ?? undefined,
+                            }
+                            : {
+                                message: String(handlerError),
+                                stack: undefined,
+                            },
+                    });
+                }
+            }
+            return new messages.ToolMessage({
+                status: 'error',
+                content: `Error: ${e.message}\n Please fix your mistakes.`,
+                name: call.name,
+                tool_call_id: call.id ?? '',
+            });
+        }
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async run(input, config) {
+        let outputs;
+        if (this.isSendInput(input)) {
+            outputs = [await this.runTool(input.lg_tool_call, config)];
+        }
+        else {
+            let messages$1;
+            if (Array.isArray(input)) {
+                messages$1 = input;
+            }
+            else if (this.isMessagesState(input)) {
+                messages$1 = input.messages;
+            }
+            else {
+                throw new Error('ToolNode only accepts BaseMessage[] or { messages: BaseMessage[] } as input.');
+            }
+            const toolMessageIds = new Set(messages$1
+                .filter((msg) => msg._getType() === 'tool')
+                .map((msg) => msg.tool_call_id));
+            let aiMessage;
+            for (let i = messages$1.length - 1; i >= 0; i--) {
+                const message = messages$1[i];
+                if (messages.isAIMessage(message)) {
+                    aiMessage = message;
+                    break;
+                }
+            }
+            if (aiMessage == null || !messages.isAIMessage(aiMessage)) {
+                throw new Error('ToolNode only accepts AIMessages as input.');
+            }
+            if (this.loadRuntimeTools) {
+                const { tools, toolMap } = this.loadRuntimeTools(aiMessage.tool_calls ?? []);
+                this.toolMap =
+                    toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+                this.programmaticCache = undefined; // Invalidate cache on toolMap change
+            }
+            outputs = await Promise.all(aiMessage.tool_calls
+                ?.filter((call) => {
+                /**
+                 * Filter out:
+                 * 1. Already processed tool calls (present in toolMessageIds)
+                 * 2. Server tool calls (e.g., web_search with IDs starting with 'srvtoolu_')
+                 *    which are executed by the provider's API and don't require invocation
+                 */
+                return ((call.id == null || !toolMessageIds.has(call.id)) &&
+                    !(call.id?.startsWith('srvtoolu_') ?? false));
+            })
+                .map((call) => this.runTool(call, config)) ?? []);
+        }
+        if (!outputs.some(langgraph.isCommand)) {
+            return (Array.isArray(input) ? outputs : { messages: outputs });
+        }
+        const combinedOutputs = [];
+        let parentCommand = null;
+        /**
+         * Collect handoff commands (Commands with string goto and Command.PARENT)
+         * for potential parallel handoff aggregation
+         */
+        const handoffCommands = [];
+        for (const output of outputs) {
+            if (langgraph.isCommand(output)) {
+                if (output.graph === langgraph.Command.PARENT &&
+                    Array.isArray(output.goto) &&
+                    output.goto.every((send) => isSend(send))) {
+                    /** Aggregate Send-based commands */
+                    if (parentCommand) {
+                        parentCommand.goto.push(...output.goto);
+                    }
+                    else {
+                        parentCommand = new langgraph.Command({
+                            graph: langgraph.Command.PARENT,
+                            goto: output.goto,
+                        });
+                    }
+                }
+                else if (output.graph === langgraph.Command.PARENT) {
+                    /**
+                     * Handoff Command with destination.
+                     * Handle both string ('agent') and array (['agent']) formats.
+                     * Collect for potential parallel aggregation.
+                     */
+                    const goto = output.goto;
+                    const isSingleStringDest = typeof goto === 'string';
+                    const isSingleArrayDest = Array.isArray(goto) &&
+                        goto.length === 1 &&
+                        typeof goto[0] === 'string';
+                    if (isSingleStringDest || isSingleArrayDest) {
+                        handoffCommands.push(output);
+                    }
+                    else {
+                        /** Multi-destination or other command - pass through */
+                        combinedOutputs.push(output);
+                    }
+                }
+                else {
+                    /** Other commands - pass through */
+                    combinedOutputs.push(output);
+                }
+            }
+            else {
+                combinedOutputs.push(Array.isArray(input) ? [output] : { messages: [output] });
+            }
+        }
+        /**
+         * Handle handoff commands - convert to Send objects for parallel execution
+         * when multiple handoffs are requested
+         */
+        if (handoffCommands.length > 1) {
+            /**
+             * Multiple parallel handoffs - convert to Send objects.
+             * Each Send carries its own state with the appropriate messages.
+             * This enables LLM-initiated parallel execution when calling multiple
+             * transfer tools simultaneously.
+             */
+            /** Collect all destinations for sibling tracking */
+            const allDestinations = handoffCommands.map((cmd) => {
+                const goto = cmd.goto;
+                return typeof goto === 'string' ? goto : goto[0];
+            });
+            const sends = handoffCommands.map((cmd, idx) => {
+                const destination = allDestinations[idx];
+                /** Get siblings (other destinations, not this one) */
+                const siblings = allDestinations.filter((d) => d !== destination);
+                /** Add siblings to ToolMessage additional_kwargs */
+                const update = cmd.update;
+                if (update && update.messages) {
+                    for (const msg of update.messages) {
+                        if (msg.getType() === 'tool') {
+                            msg.additional_kwargs.handoff_parallel_siblings =
+                                siblings;
+                        }
+                    }
+                }
+                return new langgraph.Send(destination, cmd.update);
+            });
+            const parallelCommand = new langgraph.Command({
+                graph: langgraph.Command.PARENT,
+                goto: sends,
+            });
+            combinedOutputs.push(parallelCommand);
+        }
+        else if (handoffCommands.length === 1) {
+            /** Single handoff - pass through as-is */
+            combinedOutputs.push(handoffCommands[0]);
+        }
+        if (parentCommand) {
+            combinedOutputs.push(parentCommand);
+        }
+        return combinedOutputs;
+    }
+    isSendInput(input) {
+        return (typeof input === 'object' && input != null && 'lg_tool_call' in input);
+    }
+    isMessagesState(input) {
+        return (typeof input === 'object' &&
+            input != null &&
+            'messages' in input &&
+            Array.isArray(input.messages) &&
+            input.messages.every(messages.isBaseMessage));
+    }
+}
+function areToolCallsInvoked(message, invokedToolIds) {
+    if (!invokedToolIds || invokedToolIds.size === 0)
+        return false;
+    return (message.tool_calls?.every((toolCall) => toolCall.id != null && invokedToolIds.has(toolCall.id)) ?? false);
+}
+function toolsCondition(state, toolNode, invokedToolIds) {
+    const message = Array.isArray(state)
+        ? state[state.length - 1]
+        : state.messages[state.messages.length - 1];
+    if ('tool_calls' in message &&
+        (message.tool_calls?.length ?? 0) > 0 &&
+        !areToolCallsInvoked(message, invokedToolIds)) {
+        return toolNode;
+    }
+    else {
+        return langgraph.END;
+    }
+}
+
+exports.ToolNode = ToolNode;
+exports.toolsCondition = toolsCondition;
+//# sourceMappingURL=ToolNode.cjs.map
