@@ -1,0 +1,8 @@
+import { Tool } from '@langchain/core/tools';
+export declare class Calculator extends Tool {
+    static lc_name(): string;
+    get lc_namespace(): string[];
+    name: string;
+    _call(input: string): Promise<string>;
+    description: string;
+}
