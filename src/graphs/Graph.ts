@@ -112,26 +112,41 @@ function estimateMessageTokens(message: BaseMessage): number {
 }
 
 /**
+ * Content type for OpenAI Responses API
+ */
+type ResponsesContentItem = { type: 'input_text'; text: string } | { type: 'output_text'; text: string };
+
+/**
+ * Message format for OpenAI Responses API
+ */
+interface ResponsesMessage {
+  role: string;
+  content: ResponsesContentItem[];
+}
+
+/**
  * Convert BaseMessage to OpenAI Responses API format
  * Note: Tool messages are converted to user messages since /responses/compact
  * only supports 'assistant', 'system', 'developer', and 'user' roles
+ *
+ * The Responses API requires content to be an array with typed items:
+ * - User/system messages use: { type: "input_text", text: "..." }
+ * - Assistant messages use: { type: "output_text", text: "..." }
  */
-function convertToResponsesFormat(
-  messages: BaseMessage[]
-): Array<{ role: string; content: string }> {
-  const result: Array<{ role: string; content: string }> = [];
+function convertToResponsesFormat(messages: BaseMessage[]): ResponsesMessage[] {
+  const result: ResponsesMessage[] = [];
 
   for (const msg of messages) {
     const msgType = msg._getType();
     let role: string;
-    let content: string;
+    let text: string;
 
     // Convert content to string
     if (typeof msg.content === 'string') {
-      content = msg.content;
+      text = msg.content;
     } else if (Array.isArray(msg.content)) {
       // Handle content arrays by extracting text
-      content = msg.content
+      text = msg.content
         .map((c) => {
           if (typeof c === 'string') return c;
           if (typeof c === 'object' && c !== null && 'text' in c) {
@@ -141,34 +156,44 @@ function convertToResponsesFormat(
         })
         .join('\n');
     } else {
-      content = JSON.stringify(msg.content);
+      text = JSON.stringify(msg.content);
     }
 
     // Skip empty content
-    if (!content || content.trim() === '') {
+    if (!text || text.trim() === '') {
       continue;
     }
 
+    let contentType: 'input_text' | 'output_text';
+
     if (msgType === 'human') {
       role = 'user';
+      contentType = 'input_text';
     } else if (msgType === 'ai') {
       role = 'assistant';
+      contentType = 'output_text';
       // For AI messages with tool calls but no text content, add a placeholder
-      if (!content.trim() && 'tool_calls' in msg && msg.tool_calls) {
-        content = '[Tool calls made]';
+      if (!text.trim() && 'tool_calls' in msg && msg.tool_calls) {
+        text = '[Tool calls made]';
       }
     } else if (msgType === 'system') {
       role = 'system';
+      contentType = 'input_text';
     } else if (msgType === 'tool') {
       // Convert tool messages to user messages with context
       role = 'user';
+      contentType = 'input_text';
       const toolName = 'name' in msg ? (msg as { name: string }).name : 'tool';
-      content = `[Tool result from ${toolName}]: ${content}`;
+      text = `[Tool result from ${toolName}]: ${text}`;
     } else {
       role = 'user';
+      contentType = 'input_text';
     }
 
-    result.push({ role, content });
+    result.push({
+      role,
+      content: [{ type: contentType, text }],
+    });
   }
 
   return result;
@@ -240,8 +265,17 @@ async function compactConversation(
       return { compacted: false, originalTokens: totalTokens };
     }
 
+    // Response format from Responses API:
+    // output: Array of items which can be:
+    //   - { type: "message", role: string, content: [{ type: "input_text"|"output_text", text: string }] }
+    //   - { type: "compaction", data: string } (encrypted opaque item)
+    type CompactionOutputItem =
+      | { type: 'message'; role: string; content: Array<{ type: string; text: string }> }
+      | { type: 'compaction'; data: string }
+      | { role: string; content: string | Array<{ type?: string; text?: string }> };
+
     const data = (await response.json()) as {
-      output?: Array<{ role: string; content: string | unknown[] }>;
+      output?: CompactionOutputItem[];
       usage?: { total_tokens?: number };
     };
 
@@ -252,8 +286,21 @@ async function compactConversation(
 
     // Convert compacted output back to BaseMessage format
     const { HumanMessage, AIMessage } = await import('@langchain/core/messages');
-    const compactedMessages: BaseMessage[] = data.output.map((msg) => {
-      // Content from compaction API could be string or array, handle both
+    const compactedMessages: BaseMessage[] = [];
+
+    for (const item of data.output) {
+      // Handle encrypted compaction items - these are opaque and should be preserved as-is
+      if ('type' in item && item.type === 'compaction') {
+        // Store compaction items as system messages to preserve them in context
+        compactedMessages.push(new SystemMessage({ content: `[compaction:${item.data}]` }));
+        continue;
+      }
+
+      // Handle message items (either typed or legacy format)
+      const msg = item as { role?: string; content?: unknown };
+      if (!msg.role) continue;
+
+      // Extract text from content - handle both array and string formats
       let content: string;
       if (typeof msg.content === 'string') {
         content = msg.content;
@@ -274,15 +321,18 @@ async function compactConversation(
       // Use object constructor to properly initialize LangChain messages
       switch (msg.role) {
         case 'user':
-          return new HumanMessage({ content });
+          compactedMessages.push(new HumanMessage({ content }));
+          break;
         case 'assistant':
-          return new AIMessage({ content });
+          compactedMessages.push(new AIMessage({ content }));
+          break;
         case 'system':
-          return new SystemMessage({ content });
+          compactedMessages.push(new SystemMessage({ content }));
+          break;
         default:
-          return new HumanMessage({ content });
+          compactedMessages.push(new HumanMessage({ content }));
       }
-    });
+    }
 
     const compactedTokens =
       data.usage?.total_tokens ||
