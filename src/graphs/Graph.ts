@@ -323,10 +323,32 @@ async function compactConversation(
       },
     });
 
-    const compactedTokens = data.usage?.output_tokens || data.usage?.total_tokens || 1000;
+    // Estimate actual tokens for all returned items (preserved messages + compaction items)
+    // Note: data.usage.output_tokens only reflects the compaction summary, not preserved messages
+    const estimateItemTokens = (item: Record<string, unknown>): number => {
+      // For compaction items, estimate based on encrypted_content
+      if (item.type === 'compaction' && typeof item.encrypted_content === 'string') {
+        return Math.ceil((item.encrypted_content as string).length / 4);
+      }
+      // For message items, estimate based on content
+      if (item.content) {
+        const content =
+          typeof item.content === 'string'
+            ? item.content
+            : JSON.stringify(item.content);
+        return Math.ceil(content.length / 4);
+      }
+      return 100; // Default estimate for items without clear content
+    };
+
+    const compactedTokens = data.output.reduce(
+      (sum, item) => sum + estimateItemTokens(item),
+      0
+    );
+    const compactionSummaryTokens = data.usage?.output_tokens || 0;
 
     console.log(
-      `[Compaction] Compacted: ${totalTokens} -> ${compactedTokens} tokens (${data.output.length} items preserved in response_metadata)`
+      `[Compaction] Compacted: ${totalTokens} -> ~${compactedTokens} tokens (${data.output.length} items: ${data.output.length - 1} preserved messages + 1 compaction summary of ~${compactionSummaryTokens} tokens)`
     );
 
     return {
