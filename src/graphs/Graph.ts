@@ -70,9 +70,9 @@ const { AGENT, TOOLS } = GraphNodeKeys;
  * Model context windows for compaction threshold calculation
  */
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-  'gpt-5.2': 128000,
-  'gpt-5.2-pro': 128000,
-  'gpt-5.2-codex': 128000,
+  'gpt-5.2': 300000,
+  'gpt-5.2-pro': 300000,
+  'gpt-5.2-codex': 300000,
 };
 
 /**
