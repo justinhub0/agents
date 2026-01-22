@@ -29,9 +29,9 @@ const { AGENT, TOOLS } = GraphNodeKeys;
  * Model context windows for compaction threshold calculation
  */
 const MODEL_CONTEXT_WINDOWS = {
-    'gpt-5.2': 128000,
-    'gpt-5.2-pro': 128000,
-    'gpt-5.2-codex': 128000,
+    'gpt-5.2': 300000,
+    'gpt-5.2-pro': 300000,
+    'gpt-5.2-codex': 300000,
 };
 /**
  * Get the context window size for a model
@@ -232,8 +232,25 @@ async function compactConversation(messages, config, model, instructions) {
                 output: data.output, // Raw items from compaction API - will be passed through directly
             },
         });
-        const compactedTokens = data.usage?.output_tokens || data.usage?.total_tokens || 1000;
-        console.log(`[Compaction] Compacted: ${totalTokens} -> ${compactedTokens} tokens (${data.output.length} items preserved in response_metadata)`);
+        // Estimate actual tokens for all returned items (preserved messages + compaction items)
+        // Note: data.usage.output_tokens only reflects the compaction summary, not preserved messages
+        const estimateItemTokens = (item) => {
+            // For compaction items, estimate based on encrypted_content
+            if (item.type === 'compaction' && typeof item.encrypted_content === 'string') {
+                return Math.ceil(item.encrypted_content.length / 4);
+            }
+            // For message items, estimate based on content
+            if (item.content) {
+                const content = typeof item.content === 'string'
+                    ? item.content
+                    : JSON.stringify(item.content);
+                return Math.ceil(content.length / 4);
+            }
+            return 100; // Default estimate for items without clear content
+        };
+        const compactedTokens = data.output.reduce((sum, item) => sum + estimateItemTokens(item), 0);
+        const compactionSummaryTokens = data.usage?.output_tokens || 0;
+        console.log(`[Compaction] Compacted: ${totalTokens} -> ~${compactedTokens} tokens (${data.output.length} items: ${data.output.length - 1} preserved messages + 1 compaction summary of ~${compactionSummaryTokens} tokens)`);
         return {
             compacted: true,
             messages: [compactedMessage], // Single message carrying all compacted items
