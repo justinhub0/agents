@@ -98,15 +98,92 @@ function supportsCompaction(model: string): boolean {
 }
 
 /**
+ * Fixed token estimate per image based on OpenAI's pricing model.
+ * Images are charged at a flat rate rather than by character count.
+ */
+const IMAGE_TOKEN_ESTIMATE = 1000;
+
+/**
+ * Detect if a string contains base64 image data
+ */
+function isBase64ImageData(str: string): boolean {
+  if (typeof str !== 'string') return false;
+  // Check for data URI prefix
+  if (str.startsWith('data:image/')) return true;
+  // Check for base64 pattern (long string of base64 characters without spaces)
+  // Base64 images are typically very long (>1000 chars) and contain only base64 chars
+  if (str.length > 1000 && /^[A-Za-z0-9+/=]+$/.test(str.slice(0, 100))) return true;
+  return false;
+}
+
+/**
+ * Recursively estimate tokens for content, excluding base64 image data
+ */
+function estimateTokensExcludingImages(content: unknown): number {
+  if (content === null || content === undefined) return 0;
+
+  if (typeof content === 'string') {
+    // Skip base64 image data - use fixed estimate instead
+    if (isBase64ImageData(content)) {
+      return IMAGE_TOKEN_ESTIMATE;
+    }
+    return Math.ceil(content.length / 4);
+  }
+
+  if (Array.isArray(content)) {
+    return content.reduce((sum, item) => sum + estimateTokensExcludingImages(item), 0);
+  }
+
+  if (typeof content === 'object') {
+    const obj = content as Record<string, unknown>;
+    let tokens = 0;
+
+    for (const [key, value] of Object.entries(obj)) {
+      // Skip fields that typically contain base64 image data
+      if (key === 'url' || key === 'image_url' || key === 'data') {
+        if (typeof value === 'string' && isBase64ImageData(value)) {
+          tokens += IMAGE_TOKEN_ESTIMATE;
+          continue;
+        }
+        if (typeof value === 'object' && value !== null && 'url' in value) {
+          const urlValue = (value as { url: unknown }).url;
+          if (typeof urlValue === 'string' && isBase64ImageData(urlValue)) {
+            tokens += IMAGE_TOKEN_ESTIMATE;
+            continue;
+          }
+        }
+      }
+
+      // Handle image_url and input_image content types
+      if (obj.type === 'image_url' || obj.type === 'input_image') {
+        tokens += IMAGE_TOKEN_ESTIMATE;
+        break; // Don't double count
+      }
+
+      tokens += estimateTokensExcludingImages(value);
+    }
+
+    return tokens;
+  }
+
+  return 0;
+}
+
+/**
  * Estimate tokens for a message (rough estimation: 4 chars per token)
+ * Excludes base64 image data from character counting, using fixed estimates instead.
  */
 function estimateMessageTokens(message: BaseMessage): number {
   const content = message.content;
   if (typeof content === 'string') {
+    // Check if the entire content is base64 image data
+    if (isBase64ImageData(content)) {
+      return IMAGE_TOKEN_ESTIMATE;
+    }
     return Math.ceil(content.length / 4);
   }
   if (Array.isArray(content)) {
-    return Math.ceil(JSON.stringify(content).length / 4);
+    return estimateTokensExcludingImages(content);
   }
   return 0;
 }
