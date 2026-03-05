@@ -43,6 +43,7 @@ export class AgentContext {
       reasoningKey,
       useLegacyContent,
       discoveredTools,
+      compaction,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -64,6 +65,7 @@ export class AgentContext {
       tokenCounter,
       useLegacyContent,
       discoveredTools,
+      compaction,
     });
 
     if (tokenCounter) {
@@ -106,6 +108,8 @@ export class AgentContext {
   baseIndexTokenCountMap: Record<string, number> = {};
   /** Maximum context tokens for this agent */
   maxContextTokens?: number;
+  /** Compaction configuration for this agent */
+  compaction?: t.CompactionConfig;
   /** Current usage metadata for this agent */
   currentUsage?: Partial<UsageMetadata>;
   /** Prune messages function configured for this agent */
@@ -197,6 +201,7 @@ export class AgentContext {
     instructionTokens,
     useLegacyContent,
     discoveredTools,
+    compaction,
   }: {
     agentId: string;
     name?: string;
@@ -216,6 +221,7 @@ export class AgentContext {
     instructionTokens?: number;
     useLegacyContent?: boolean;
     discoveredTools?: string[];
+    compaction?: t.CompactionConfig;
   }) {
     this.agentId = agentId;
     this.name = name;
@@ -241,6 +247,7 @@ export class AgentContext {
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
+    this.compaction = compaction;
 
     if (discoveredTools && discoveredTools.length > 0) {
       for (const toolName of discoveredTools) {

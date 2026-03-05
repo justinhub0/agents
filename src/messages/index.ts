@@ -5,3 +5,4 @@ export * from './format';
 export * from './cache';
 export * from './content';
 export * from './tools';
+export * from './compact';

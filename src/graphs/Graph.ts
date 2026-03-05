@@ -41,6 +41,11 @@ import {
   createPruneMessages,
   addCacheControl,
   getMessageId,
+  compactConversation,
+  supportsCompaction,
+  getModelContextWindow,
+  estimateMessageTokens,
+  truncateToFitContext,
 } from '@/messages';
 import {
   GraphNodeKeys,
@@ -815,6 +820,55 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         });
         agentContext.indexTokenCountMap = indexTokenCountMap;
         messagesToUse = context;
+      }
+
+      /**
+       * Context compaction check - runs between agent loop iterations.
+       * When token count approaches context limit, compress conversation
+       * using OpenAI's /responses/compact endpoint.
+       */
+      const modelName =
+        (agentContext.clientOptions as t.OpenAIClientOptions)?.model || '';
+      const compactionEnabled = agentContext.compaction?.enabled;
+      const hasApiKey = !!agentContext.compaction?.apiKey;
+      const modelSupported = supportsCompaction(modelName);
+
+      if (
+        compactionEnabled &&
+        hasApiKey &&
+        modelSupported &&
+        agentContext.compaction
+      ) {
+        const compactionResult = await compactConversation(
+          messagesToUse,
+          agentContext.compaction,
+          modelName,
+          agentContext.instructions
+        );
+
+        if (compactionResult.compacted && compactionResult.messages) {
+          console.log(
+            `[Compaction] Using compacted messages: ${compactionResult.originalTokens} -> ${compactionResult.compactedTokens} tokens`
+          );
+          messagesToUse = compactionResult.messages;
+          // Reset token count map since messages have been compacted
+          agentContext.indexTokenCountMap = {};
+        }
+
+        // If still over context limit after compaction, truncate as fallback
+        const contextWindow = getModelContextWindow(modelName);
+        const currentTokens = messagesToUse.reduce(
+          (sum, m) => sum + estimateMessageTokens(m),
+          0
+        );
+
+        if (currentTokens > contextWindow * 0.9) {
+          console.log(
+            `[Compaction] Still over limit after compaction (${currentTokens} > ${contextWindow * 0.9}), applying truncation...`
+          );
+          messagesToUse = truncateToFitContext(messagesToUse, contextWindow);
+          agentContext.indexTokenCountMap = {};
+        }
       }
 
       let finalMessages = messagesToUse;

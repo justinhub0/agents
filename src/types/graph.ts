@@ -389,4 +389,28 @@ export interface AgentInputs {
    * in tool binding without requiring tool_search.
    */
   discoveredTools?: string[];
+  /**
+   * Compaction configuration for managing context limits during agent execution.
+   * When enabled, compaction is triggered between API calls when token count
+   * approaches the context limit.
+   */
+  compaction?: CompactionConfig;
+}
+
+/**
+ * Configuration for context compaction
+ */
+export interface CompactionConfig {
+  /** Whether compaction is enabled */
+  enabled: boolean;
+  /** API key for the compaction service */
+  apiKey: string;
+  /** Base URL for the compaction service (defaults to OpenAI API) */
+  baseURL?: string;
+  /** Percentage of context window to trigger compaction (0-1, default: 0.70) */
+  thresholdPercent?: number;
+  /** Minimum tokens before compaction can trigger (default: 10000) */
+  minTokensBeforeCompaction?: number;
+  /** Preserve instructions during compaction (default: true) */
+  preserveInstructions?: boolean;
 }
