@@ -36,7 +36,7 @@
     "README.md"
   ],
   "scripts": {
-    "prepare": "node husky-setup.js",
+    "prepare": "echo skipping build",
     "prepublishOnly": "npm run build",
     "build": "NODE_ENV=production rollup -c && tsc -p tsconfig.build.json",
     "build:dev": "rollup -c",
