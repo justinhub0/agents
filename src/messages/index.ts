@@ -6,3 +6,6 @@ export * from './cache';
 export * from './content';
 export * from './tools';
 export * from './compact';
+export * from './contextPruning';
+export * from './contextPruningSettings';
+export * from './reducer';
